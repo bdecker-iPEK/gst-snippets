@@ -24,102 +24,72 @@
  */
 
 #include <gst/gst.h>
+#include <unistd.h>
 
-static GMainLoop *loop;
-static GstElement *pipeline;
-static GstElement *src, *conv, *sink;
+static GstElement* m_pipeline;
 
-static gboolean
-message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
+static void on_pad_added(GstElement* rtpbin, GstPad* pad, GstElement* depay)
 {
-  switch (GST_MESSAGE_TYPE (message)) {
-    case GST_MESSAGE_ERROR:{
-      GError *err = NULL;
-      gchar *name, *debug = NULL;
+  if (!g_str_has_prefix(GST_OBJECT_NAME(pad), "recv_rtp_src_"))
+    return;
 
-      name = gst_object_get_path_string (message->src);
-      gst_message_parse_error (message, &err, &debug);
-
-      g_printerr ("ERROR: from element %s: %s\n", name, err->message);
-      if (debug != NULL)
-        g_printerr ("Additional debug info:\n%s\n", debug);
-
-      g_error_free (err);
-      g_free (debug);
-      g_free (name);
-
-      g_main_loop_quit (loop);
-      break;
-    }
-    case GST_MESSAGE_WARNING:{
-      GError *err = NULL;
-      gchar *name, *debug = NULL;
-
-      name = gst_object_get_path_string (message->src);
-      gst_message_parse_warning (message, &err, &debug);
-
-      g_printerr ("ERROR: from element %s: %s\n", name, err->message);
-      if (debug != NULL)
-        g_printerr ("Additional debug info:\n%s\n", debug);
-
-      g_error_free (err);
-      g_free (debug);
-      g_free (name);
-      break;
-    }
-    case GST_MESSAGE_EOS:
-      g_print ("Got EOS\n");
-      g_main_loop_quit (loop);
-      break;
-    default:
-      break;
+  GstPad* sinkpad = gst_element_get_static_pad(depay, "sink");
+  GstPad* peer = gst_pad_get_peer(sinkpad);
+  if (peer) {
+    gst_pad_unlink(peer, sinkpad);
+    gst_object_unref(peer);
   }
-
-  return TRUE;
+  gst_pad_link(pad, sinkpad);
+  gst_object_unref(sinkpad);
 }
 
 int
 main (int argc, char **argv)
 {
-  GstBus *bus;
+  gst_init(NULL, NULL);
 
-  gst_init (&argc, &argv);
+  m_pipeline = gst_parse_launch("udpsrc address=224.0.0.1 name=udpsrc port=5600 multicast-iface=eth0 caps=\"application/x-rtp,media=(string)video,clock-rate=(int)90000,encoding-name=(string)H264,payload=(int)96 \"       rtph264depay name=depay ! h264parse ! omxh264dec ! queue ! fakesink       rtpbin name=rtpbin", NULL);
+  g_assert(m_pipeline != NULL);
 
-  pipeline = gst_pipeline_new (NULL);
-  src = gst_element_factory_make ("videotestsrc", NULL);
-  conv = gst_element_factory_make ("videoconvert", NULL);
-  sink = gst_element_factory_make ("autovideosink", NULL);
+  GstElement* rtpbin = gst_bin_get_by_name(GST_BIN(m_pipeline), "rtpbin");
+  GstElement* depay = gst_bin_get_by_name(GST_BIN(m_pipeline), "depay");
+  GstElement* udpsrc = gst_bin_get_by_name(GST_BIN(m_pipeline), "udpsrc");
+  gst_element_link_pads(udpsrc, "src", rtpbin, "recv_rtp_sink_%u");
+  g_signal_connect (rtpbin, "pad-added", G_CALLBACK(on_pad_added), depay);
+  gst_object_unref(rtpbin);
+  gst_object_unref(depay);
+  gst_object_unref(udpsrc);
 
-  if (!pipeline || !src || !conv || !sink) {
-    g_error ("Failed to create elements");
-    return -1;
-  }
+  gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
+  sleep(5);
+  //working as expected
 
-  gst_bin_add_many (GST_BIN (pipeline), src, conv, sink, NULL);
-  if (!gst_element_link_many (src, conv, sink, NULL)) {
-    g_error ("Failed to link elements");
-    return -2;
-  }
 
-  loop = g_main_loop_new (NULL, FALSE);
+  gst_element_set_state(m_pipeline, GST_STATE_READY);
+  sleep(5);
+  //working as expected
 
-  bus = gst_pipeline_get_bus (GST_PIPELINE (pipeline));
-  gst_bus_add_signal_watch (bus);
-  g_signal_connect (G_OBJECT (bus), "message", G_CALLBACK (message_cb), NULL);
-  gst_object_unref (GST_OBJECT (bus));
 
-  if (gst_element_set_state (pipeline,
-          GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-    g_error ("Failed to go into PLAYING state");
-    return -3;
-  }
+  gst_element_set_state(m_pipeline, GST_STATE_PLAYING);
+  sleep(5);
+  /*
+  not working
 
-  g_main_loop_run (loop);
+0:00:10.189213850  2373  0x1124090 WARN         rtpjitterbuffer rtpjitterbuffer.c:587:calculate_skew: delta - skew: 0:00:05.018867690 too big, reset skew
 
-  gst_element_set_state (pipeline, GST_STATE_NULL);
+(app:2373): GStreamer-CRITICAL **: 13:18:41.078: Padname recv_rtp_src_0_558365334_96 is not unique in element rtpbin, not adding
+0:00:10.389308329  2373  0x1124090 WARN                 basesrc gstbasesrc.c:3072:gst_base_src_loop:<udpsrc> error: Internal data stream error.
+0:00:10.389427131  2373  0x1124090 WARN                 basesrc gstbasesrc.c:3072:gst_base_src_loop:<udpsrc> error: streaming stopped, reason not-linked (-1)
 
-  g_main_loop_unref (loop);
-  gst_object_unref (pipeline);
+(app:2373): GStreamer-CRITICAL **: 13:18:45.883: gst_pad_set_active: assertion 'GST_IS_PAD (pad)' failed
 
+(app:2373): GStreamer-CRITICAL **: 13:18:45.884: gst_element_remove_pad: assertion 'GST_IS_PAD (pad)' failed
+
+  */
+
+
+  gst_element_set_state(m_pipeline, GST_STATE_NULL);
+  gst_object_unref(m_pipeline);
+  gst_deinit();
   return 0;
 }
